@@ -42,13 +42,36 @@ def set_firestore_state(db: firestore.Client, **fields):
     doc_ref.set(fields, merge=True)
 
 
-def tmdb_discover_movies(api_key: str, start_page: int, pages: int):
+def build_tmdb_auth(api_secret: str):
+    """
+    TMDB auth fix:
+    - If secret looks like TMDB v4 token (JWT-ish), use Authorization: Bearer <token>
+    - Else treat it as TMDB v3 API key and pass ?api_key=...
+    """
+    s = (api_secret or "").strip()
+
+    # Heuristic: v4 token is usually a JWT starting with "eyJ" and has dots.
+    is_v4_bearer = (s.startswith("eyJ") and "." in s)
+
+    headers = {"accept": "application/json"}
+    params = {}
+
+    if is_v4_bearer:
+        headers["Authorization"] = f"Bearer {s}"
+    else:
+        # Assume v3 API key
+        params["api_key"] = s
+
+    return headers, params, ("v4_bearer" if is_v4_bearer else "v3_api_key")
+
+
+def tmdb_discover_movies(api_secret: str, start_page: int, pages: int):
     """
     TMDB discover returns ~20 results per page.
     For ~2000 rows per run -> pages ~100.
     """
     base_url = "https://api.themoviedb.org/3/discover/movie"
-    headers = {"accept": "application/json"}
+    headers, base_params, auth_mode = build_tmdb_auth(api_secret)
 
     all_rows = []
     now_ts = datetime.datetime.utcnow().isoformat()
@@ -60,13 +83,23 @@ def tmdb_discover_movies(api_key: str, start_page: int, pages: int):
 
     for page in range(start_page, end_page + 1):
         params = {
-            "api_key": api_key,
+            **base_params,
             "language": "en-US",
             "sort_by": "popularity.desc",
             "page": page,
         }
 
         r = requests.get(base_url, headers=headers, params=params, timeout=30)
+
+        # Make the error message clearer in logs if TMDB rejects auth
+        if r.status_code == 401:
+            raise requests.HTTPError(
+                f"TMDB 401 Unauthorized. auth_mode={auth_mode}. "
+                f"Check Secret Manager value for '{os.environ.get('SECRET_NAME','tmdb-api-key')}'. "
+                f"Response: {r.text}",
+                response=r,
+            )
+
         r.raise_for_status()
         data = r.json()
 
@@ -87,7 +120,7 @@ def tmdb_discover_movies(api_key: str, start_page: int, pages: int):
 
         last_success_page = page
 
-    return all_rows, last_success_page, last_total_pages
+    return all_rows, last_success_page, last_total_pages, auth_mode
 
 
 @app.get("/")
@@ -124,10 +157,10 @@ def run_ingestion():
     start_page = int(request.args.get("start_page", next_page))
     pages = int(request.args.get("pages", default_pages))
 
-    api_key = get_secret(project_id, secret_name)
+    api_secret = get_secret(project_id, secret_name)
 
-    rows, last_success_page, total_pages = tmdb_discover_movies(
-        api_key, start_page=start_page, pages=pages
+    rows, last_success_page, total_pages, auth_mode = tmdb_discover_movies(
+        api_secret, start_page=start_page, pages=pages
     )
 
     batch_date = datetime.date.today().isoformat()
@@ -156,6 +189,7 @@ def run_ingestion():
         last_run_rows=len(rows),
         last_run_gcs_path=f"gs://{bucket_name}/{gcs_path}",
         total_pages=total_pages,
+        auth_mode=auth_mode,
     )
 
     return jsonify(
@@ -168,5 +202,6 @@ def run_ingestion():
             "pages_requested": pages,
             "next_page_saved": new_next_page,
             "total_pages_seen": total_pages,
+            "auth_mode": auth_mode,
         }
     )
