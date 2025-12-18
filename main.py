@@ -10,8 +10,9 @@ from google.cloud import firestore
 
 app = Flask(__name__)
 
-STATE_COLLECTION = os.environ.get("STATE_COLLECTION", "ingestion_state")
-STATE_DOC_ID = os.environ.get("STATE_DOC_ID", "tmdb_discover_movie")
+# Support both env naming styles
+STATE_COLLECTION = os.environ.get("STATE_COLLECTION") or os.environ.get("CURSOR_COLLECTION") or "cursors"
+STATE_DOC_ID = os.environ.get("STATE_DOC_ID") or os.environ.get("CURSOR_DOC") or "tmdb_discover"
 
 
 def get_secret(project_id: str, secret_name: str) -> str:
@@ -42,36 +43,15 @@ def set_firestore_state(db: firestore.Client, **fields):
     doc_ref.set(fields, merge=True)
 
 
-def build_tmdb_auth(api_secret: str):
-    """
-    TMDB auth fix:
-    - If secret looks like TMDB v4 token (JWT-ish), use Authorization: Bearer <token>
-    - Else treat it as TMDB v3 API key and pass ?api_key=...
-    """
-    s = (api_secret or "").strip()
-
-    # Heuristic: v4 token is usually a JWT starting with "eyJ" and has dots.
-    is_v4_bearer = (s.startswith("eyJ") and "." in s)
-
-    headers = {"accept": "application/json"}
-    params = {}
-
-    if is_v4_bearer:
-        headers["Authorization"] = f"Bearer {s}"
-    else:
-        # Assume v3 API key
-        params["api_key"] = s
-
-    return headers, params, ("v4_bearer" if is_v4_bearer else "v3_api_key")
-
-
-def tmdb_discover_movies(api_secret: str, start_page: int, pages: int):
+def tmdb_discover_movies(tmdb_credential: str, start_page: int, pages: int, auth_mode: str):
     """
     TMDB discover returns ~20 results per page.
     For ~2000 rows per run -> pages ~100.
+    auth_mode:
+      - "v3" -> uses ?api_key=
+      - "v4" -> uses Authorization: Bearer <token>
     """
     base_url = "https://api.themoviedb.org/3/discover/movie"
-    headers, base_params, auth_mode = build_tmdb_auth(api_secret)
 
     all_rows = []
     now_ts = datetime.datetime.utcnow().isoformat()
@@ -83,22 +63,23 @@ def tmdb_discover_movies(api_secret: str, start_page: int, pages: int):
 
     for page in range(start_page, end_page + 1):
         params = {
-            **base_params,
             "language": "en-US",
             "sort_by": "popularity.desc",
             "page": page,
         }
 
+        headers = {"accept": "application/json"}
+
+        if auth_mode == "v3":
+            params["api_key"] = tmdb_credential
+        else:
+            headers["Authorization"] = f"Bearer {tmdb_credential}"
+
         r = requests.get(base_url, headers=headers, params=params, timeout=30)
 
-        # Make the error message clearer in logs if TMDB rejects auth
+        # If unauthorized, stop and raise a useful error
         if r.status_code == 401:
-            raise requests.HTTPError(
-                f"TMDB 401 Unauthorized. auth_mode={auth_mode}. "
-                f"Check Secret Manager value for '{os.environ.get('SECRET_NAME','tmdb-api-key')}'. "
-                f"Response: {r.text}",
-                response=r,
-            )
+            raise RuntimeError("TMDB returned 401 Unauthorized. Your TMDB key/token is invalid or wrong auth mode.")
 
         r.raise_for_status()
         data = r.json()
@@ -106,7 +87,6 @@ def tmdb_discover_movies(api_secret: str, start_page: int, pages: int):
         total_pages = int(data.get("total_pages", 0) or 0)
         last_total_pages = total_pages if total_pages else last_total_pages
 
-        # If TMDB says there are no more pages, stop early
         if total_pages and page > total_pages:
             break
 
@@ -120,7 +100,7 @@ def tmdb_discover_movies(api_secret: str, start_page: int, pages: int):
 
         last_success_page = page
 
-    return all_rows, last_success_page, last_total_pages, auth_mode
+    return all_rows, last_success_page, last_total_pages
 
 
 @app.get("/")
@@ -133,75 +113,77 @@ def read_state():
     project_id = os.environ["PROJECT_ID"]
     db = firestore.Client(project=project_id)
     state = get_firestore_state(db)
-    return jsonify({"state": state})
+    return jsonify({"collection": STATE_COLLECTION, "doc": STATE_DOC_ID, "state": state})
 
 
 @app.get("/run")
 def run_ingestion():
-    project_id = os.environ["PROJECT_ID"]
-    bucket_name = os.environ["BUCKET_NAME"]
-    secret_name = os.environ.get("SECRET_NAME", "tmdb-api-key")
+    try:
+        project_id = os.environ["PROJECT_ID"]
+        bucket_name = os.environ["BUCKET_NAME"]
+        secret_name = os.environ.get("SECRET_NAME", "tmdb-api-key")
 
-    # pages per run: set this to 100 for ~2000 rows (20 per page)
-    default_pages = int(os.environ.get("PAGES_PER_RUN", os.environ.get("PAGES", "100")))
+        # 100 pages ~ 2000 rows (20/page)
+        default_pages = int(os.environ.get("PAGES_PER_RUN", "100"))
 
-    db = firestore.Client(project=project_id)
-    state = get_firestore_state(db)
+        db = firestore.Client(project=project_id)
+        state = get_firestore_state(db)
+        next_page = int(state.get("next_page", 1))
 
-    # Cursor logic:
-    # next_page is where we continue from. Default = 1
-    next_page = int(state.get("next_page", 1))
+        start_page = int(request.args.get("start_page", next_page))
+        pages = int(request.args.get("pages", default_pages))
 
-    # Optional override (useful for debugging):
-    # /run?start_page=1&pages=100
-    start_page = int(request.args.get("start_page", next_page))
-    pages = int(request.args.get("pages", default_pages))
+        tmdb_credential = get_secret(project_id, secret_name)
 
-    api_secret = get_secret(project_id, secret_name)
+        # Decide auth mode:
+        # If token looks long (v4 tokens are long), use v4, else v3
+        auth_mode = "v4" if len(tmdb_credential) > 40 else "v3"
 
-    rows, last_success_page, total_pages, auth_mode = tmdb_discover_movies(
-        api_secret, start_page=start_page, pages=pages
-    )
+        rows, last_success_page, total_pages = tmdb_discover_movies(
+            tmdb_credential, start_page=start_page, pages=pages, auth_mode=auth_mode
+        )
 
-    batch_date = datetime.date.today().isoformat()
-    ts_compact = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        batch_date = datetime.date.today().isoformat()
+        ts_compact = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
-    # Unique file per run (append-style)
-    gcs_path = (
-        f"raw/api/batch_date={batch_date}/"
-        f"movies_pages_{start_page}_to_{last_success_page}_{ts_compact}.jsonl"
-    )
+        gcs_path = (
+            f"raw/api/batch_date={batch_date}/"
+            f"movies_pages_{start_page}_to_{last_success_page}_{ts_compact}.jsonl"
+        )
 
-    jsonl = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n"
-    upload_to_gcs(bucket_name, gcs_path, jsonl)
+        jsonl = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n"
+        upload_to_gcs(bucket_name, gcs_path, jsonl)
 
-    # Update cursor:
-    # If we reached the end, wrap back to 1 (optional but practical)
-    new_next_page = last_success_page + 1
-    if total_pages and new_next_page > total_pages:
-        new_next_page = 1
+        new_next_page = last_success_page + 1
+        if total_pages and new_next_page > total_pages:
+            new_next_page = 1
 
-    set_firestore_state(
-        db,
-        next_page=new_next_page,
-        last_run_start_page=start_page,
-        last_run_end_page=last_success_page,
-        last_run_rows=len(rows),
-        last_run_gcs_path=f"gs://{bucket_name}/{gcs_path}",
-        total_pages=total_pages,
-        auth_mode=auth_mode,
-    )
+        set_firestore_state(
+            db,
+            next_page=new_next_page,
+            last_run_start_page=start_page,
+            last_run_end_page=last_success_page,
+            last_run_rows=len(rows),
+            last_run_gcs_path=f"gs://{bucket_name}/{gcs_path}",
+            total_pages=total_pages,
+            tmdb_auth_mode=auth_mode,
+        )
 
-    return jsonify(
-        {
-            "message": "ingestion_success",
-            "rows": len(rows),
-            "gcs_path": f"gs://{bucket_name}/{gcs_path}",
-            "start_page": start_page,
-            "end_page": last_success_page,
-            "pages_requested": pages,
-            "next_page_saved": new_next_page,
-            "total_pages_seen": total_pages,
-            "auth_mode": auth_mode,
-        }
-    )
+        return jsonify(
+            {
+                "message": "ingestion_success",
+                "rows": len(rows),
+                "gcs_path": f"gs://{bucket_name}/{gcs_path}",
+                "start_page": start_page,
+                "end_page": last_success_page,
+                "pages_requested": pages,
+                "next_page_saved": new_next_page,
+                "total_pages_seen": total_pages,
+                "tmdb_auth_mode": auth_mode,
+            }
+        )
+
+    except Exception as e:
+        # Return JSON error instead of blank Internal Server Error page
+        return jsonify({"message": "ingestion_failed", "error": str(e)}), 500
+
